@@ -44,18 +44,20 @@ from pyannote.core.utils.numpy import one_hot_encoding
 from pyannote.audio.features import RawAudio
 from pyannote.audio.features.utils import get_audio_duration
 
-from pyannote.generators.batch import batchify
 from pyannote.generators.fragment import random_segment
 from pyannote.generators.fragment import random_subsegment
 from pyannote.generators.fragment import SlidingSegments
 
 from pyannote.audio.train.trainer import Trainer
-from pyannote.audio.train.generator import BatchGenerator
+from pyannote.audio.train.generator import SampleGenerator
 
 from pyannote.audio.train.task import Task, TaskType, TaskOutput
 
+from pescador import Streamer
+from pescador import ZMQStreamer
 
-class LabelingTaskGenerator(BatchGenerator):
+
+class LabelingTaskGenerator(SampleGenerator):
     """Base batch generator for various labeling tasks
 
     This class should be inherited from: it should not be used directy
@@ -88,10 +90,8 @@ class LabelingTaskGenerator(BatchGenerator):
         Defaults to one day (1).
     in_memory : `bool`, optional
         Pre-load training set in memory.
-    parallel : int, optional
-        Number of prefetching background generators. Defaults to 1. Each
-        generator will prefetch enough batches to cover a whole epoch. Set
-        `parallel` to 0 to not use background generators.
+    parallel : `bool`, optional
+        Set to True to generate samples in the background.
     exhaustive : bool, optional
         Ensure training files are covered exhaustively (useful in case of
         non-uniform label distribution).
@@ -123,7 +123,7 @@ class LabelingTaskGenerator(BatchGenerator):
                  batch_size=32,
                  per_epoch=1,
                  in_memory=False,
-                 parallel=1,
+                 parallel=False,
                  exhaustive=False,
                  shuffle=False,
                  mask_dimension=None,
@@ -146,7 +146,6 @@ class LabelingTaskGenerator(BatchGenerator):
         self.batch_size = batch_size
         self.per_epoch = per_epoch
         self.parallel = parallel
-
         self.in_memory = in_memory
         if self.in_memory:
             if not isinstance(feature_extraction, RawAudio):
@@ -195,7 +194,6 @@ class LabelingTaskGenerator(BatchGenerator):
         y, _ = one_hot_encoding(current_file['annotation'],
                                 get_annotated(current_file),
                                 self.resolution,
-                                labels=self.segment_labels_,
                                 mode='center')
 
         return SlidingWindowFeature(self.postprocess_y(y.data),
@@ -238,7 +236,7 @@ class LabelingTaskGenerator(BatchGenerator):
         """
 
         self.data_ = {}
-        segment_labels, file_labels = set(), dict()
+        file_labels = dict()
 
         # loop once on all files
         for current_file in getattr(protocol, subset)():
@@ -253,9 +251,6 @@ class LabelingTaskGenerator(BatchGenerator):
             if self.in_memory:
                 current_file['waveform'] = \
                     self.feature_extraction(current_file).data
-
-            # keep track of unique segment labels
-            segment_labels.update(current_file['annotation'].labels())
 
             # keep track of unique file labels
             for key, value in current_file.items():
@@ -285,24 +280,10 @@ class LabelingTaskGenerator(BatchGenerator):
             self.data_[uri] = datum
 
         self.file_labels_ = {k: sorted(file_labels[k]) for k in file_labels}
-        self.segment_labels_ = sorted(segment_labels)
 
         for current_file in getattr(protocol, subset)():
             uri = get_unique_identifier(current_file)
             self.data_[uri]['y'] = self.initialize_y(current_file)
-
-    @property
-    def signature(self):
-        signature = {'X': {'@': (None, np.stack)},
-                     'y': {'@': (None, np.stack)}}
-
-        if self.mask_dimension is not None:
-            signature['mask'] = {'@': (None, np.stack)}
-
-        for key in self.file_labels_:
-            signature[key] = {'@': (None, np.stack)}
-
-        return signature
 
     @property
     def specifications(self):
@@ -320,16 +301,22 @@ class LabelingTaskGenerator(BatchGenerator):
             'task': Task(type=TaskType.MULTI_CLASS_CLASSIFICATION,
                          output=TaskOutput.SEQUENCE),
             'X': {'dimension': self.feature_extraction.dimension},
-            'y': {'classes': self.segment_labels_},
+            'y': dict(),
         }
 
         return specs
 
-    def _samples(self):
+    def __iter__(self):
+
         if self.exhaustive:
-            return self._sliding_samples()
+            samples = Streamer(self._sliding_samples)
         else:
-            return self._random_samples()
+            samples = Streamer(self._random_samples)
+
+        if self.parallel:
+            return ZMQStreamer(samples).iterate()
+        else:
+            return samples.iterate()
 
     def _random_samples(self):
         """Random samples
@@ -386,8 +373,8 @@ class LabelingTaskGenerator(BatchGenerator):
 
                 sample['mask'] = mask
 
-            for key, classes in self.file_labels_.items():
-                sample[key] = classes.index(current_file[key])
+            # for key, classes in self.file_labels_.items():
+            #     sample[key] = classes.index(current_file[key])
 
             yield sample
 
@@ -456,8 +443,8 @@ class LabelingTaskGenerator(BatchGenerator):
                             mask = scipy.signal.resample(mask, len(y), axis=0)
                         sample['mask'] = mask
 
-                    for key, classes in self.file_labels_.items():
-                        sample[key] = classes.index(current_file[key])
+                    # for key, classes in self.file_labels_.items():
+                    #     sample[key] = classes.index(current_file[key])
 
                     if self.shuffle:
                         samples.append(sample)
@@ -476,43 +463,6 @@ class LabelingTaskGenerator(BatchGenerator):
         duration_per_batch = self.duration * self.batch_size
         return int(np.ceil(duration_per_epoch / duration_per_batch))
 
-    def __call__(self):
-        """(Parallelized) batch generator"""
-
-        # number of batches needed to complete an epoch
-        batches_per_epoch = self.batches_per_epoch
-
-        generators = []
-
-        if self.parallel:
-            for _ in range(self.parallel):
-
-                # batchify sampler and make sure at least
-                # `batches_per_epoch` batches are prefetched.
-                batches = batchify(self._samples(), self.signature,
-                                   batch_size=self.batch_size,
-                                   prefetch=batches_per_epoch)
-
-                # add batch generator to the list of (background) generators
-                generators.append(batches)
-        else:
-
-            # batchify sampler without prefetching
-            batches = batchify(self._samples(), self.signature,
-                               batch_size=self.batch_size, prefetch=0)
-
-            # add it to the list of generators
-            # NOTE: this list will only contain one generator
-            generators.append(batches)
-
-        # loop on (background) generators indefinitely
-        while True:
-            for batches in generators:
-                # yield `batches_per_epoch` batches from current generator
-                # so that each epoch is covered by exactly one generator
-                for _ in range(batches_per_epoch):
-                    yield next(batches)
-
 
 class LabelingTask(Trainer):
     """Base class for various labeling tasks
@@ -528,10 +478,8 @@ class LabelingTask(Trainer):
     per_epoch : float, optional
         Total audio duration per epoch, in days.
         Defaults to one day (1).
-    parallel : int, optional
-        Number of prefetching background generators. Defaults to 1.
-        Each generator will prefetch enough batches to cover a whole epoch.
-        Set `parallel` to 0 to not use background generators.
+    parallel : `bool`, optional
+        Set to True to generate samples in the background.
     """
 
     def __init__(self, duration=3.2, batch_size=32, per_epoch=1,
@@ -644,46 +592,36 @@ class LabelingTask(Trainer):
             ['loss'] (`torch.Tensor`) : Loss
         """
 
-        # forward pass
-        X = torch.tensor(batch['X'],
-                         dtype=torch.float32,
-                         device=self.device_)
-        fX = self.model_(X)
-
+        # transfer target, mask and weights to device asynchronously
         mask = None
         if self.task_.is_multiclass_classification:
 
-            fX = fX.view((-1, self.n_classes_))
-
-            target = torch.tensor(
-                batch['y'],
-                dtype=torch.int64,
-                device=self.device_).contiguous().view((-1, ))
+            target = batch['y'].to(self.device_,
+                                   non_blocking=True).contiguous().view((-1, ))
 
             if 'mask' in batch:
-                mask = torch.tensor(
-                    batch['mask'],
-                    dtype=torch.float32,
-                    device=self.device_).contiguous().view((-1, ))
-
+                mask = batch['mask'].to(self.device_,
+                                        non_blocking=True).contiguous().view((-1, ))
 
         elif self.task_.is_multilabel_classification or \
              self.task_.is_regression:
 
-            target = torch.tensor(
-                batch['y'],
-                dtype=torch.float32,
-                device=self.device_)
-
+            target = batch['y'].to(self.device_,
+                                   non_blocking=True)
             if 'mask' in batch:
-                mask = torch.tensor(
-                    batch['mask'],
-                    dtype=torch.float32,
-                    device=self.device_)
+                mask = batch['mask'].to(self.device_,
+                                        non_blocking=True)
 
         weight = self.weight
         if weight is not None:
-            weight = weight.to(device=self.device_)
+            weight = weight.to(device=self.device_, non_blocking=True)
+
+        # transfer input to device and run forward pass
+        X = batch['X'].to(self.device_)
+        fX = self.model_(X)
+
+        if self.task_.is_multiclass_classification:
+            fX = fX.view((-1, self.n_classes_))
 
         return {
             'loss': self.loss_func_(fX, target,

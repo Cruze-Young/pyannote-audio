@@ -43,9 +43,12 @@ except ImportError as e:
 # TODO: move this to pyannote.database
 Subset = Optional[Literal['train', 'development', 'test']]
 
+from torch.utils.data import IterableDataset
 
-class BatchGenerator(metaclass=ABCMeta):
-    """Batch generator base class
+
+class SampleGenerator(IterableDataset,
+                      metaclass=ABCMeta):
+    """Sample generator base class
 
     Parameters
     ----------
@@ -89,5 +92,5 @@ class BatchGenerator(metaclass=ABCMeta):
         pass
 
     @abstractmethod
-    def __call__(self) -> Iterator:
+    def __iter__(self) -> Iterator:
         pass

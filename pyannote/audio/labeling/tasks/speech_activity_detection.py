@@ -63,10 +63,8 @@ class SpeechActivityDetectionGenerator(LabelingTaskGenerator):
     per_epoch : float, optional
         Total audio duration per epoch, in days.
         Defaults to one day (1).
-    parallel : int, optional
-        Number of prefetching background generators. Defaults to 1.
-        Each generator will prefetch enough batches to cover a whole epoch.
-        Set `parallel` to 0 to not use background generators.
+    parallel : `bool`, optional
+        Set to True to generate samples in the background.
     """
 
     def postprocess_y(self, Y):
@@ -122,10 +120,8 @@ class SpeechActivityDetection(LabelingTask):
     per_epoch : float, optional
         Total audio duration per epoch, in days.
         Defaults to one day (1).
-    parallel : int, optional
-        Number of prefetching background generators. Defaults to 1.
-        Each generator will prefetch enough batches to cover a whole epoch.
-        Set `parallel` to 0 to not use background generators.
+    parallel : `bool`, optional
+        Set to True to generate samples in the background.
     """
 
     def get_batch_generator(self, feature_extraction, protocol, subset='train',

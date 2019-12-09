@@ -121,7 +121,7 @@ class Model(Module):
     def get_resolution(self, **architecture_params) -> Resolution:
         """Get target resolution
 
-        This method is called by `BatchGenerator` instances to determine how
+        This method is called by `SampleGenerator` instances to determine how
         target tensors should be built.
 
         Depending on the task and the architecture, the output of a model will
@@ -166,7 +166,7 @@ class Model(Module):
     def get_alignment(self, **architecture_params) -> Alignment:
         """Get target alignment
 
-        This method is called by `BatchGenerator` instances to dermine how
+        This method is called by `SampleGenerator` instances to dermine how
         target tensors should be aligned with the output of the model.
 
         Default behavior is to return 'center'. In most cases, you should not

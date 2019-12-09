@@ -42,12 +42,13 @@ from itertools import chain
 from torch.nn import Module
 from torch.optim import Optimizer, SGD
 from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import DataLoader
 from .logging import Logging
 from .callback import Callback
 from .callback import Callbacks
 from .schedulers import BaseSchedulerCallback
 from .schedulers import ConstantScheduler
-from .generator import BatchGenerator
+from .generator import SampleGenerator
 from .model import Model
 from ..utils.timeout import timeout
 
@@ -206,7 +207,7 @@ class Trainer:
 
     @property
     def specifications(self):
-        return self.batch_generator_.specifications
+        return self.sample_generator_.specifications
 
     @property
     def device(self):
@@ -218,7 +219,7 @@ class Trainer:
 
     def fit_iter(self,
                  model: Model,
-                 batch_generator: BatchGenerator,
+                 sample_generator: SampleGenerator,
                  warm_start: Union[int, Path] = 0,
                  epochs: int = 1000,
                  get_optimizer: Callable[..., Optimizer] = SGD,
@@ -228,6 +229,7 @@ class Trainer:
                  verbosity: int = 2,
                  device: Optional[torch.device] = None,
                  callbacks: Optional[List[Callback]] = None,
+                 parallel: bool = False,
                  ) -> Iterator[Model]:
         """Train model
 
@@ -235,8 +237,8 @@ class Trainer:
         ----------
         model : `Model`
             Model.
-        batch_generator : `BatchGenerator`
-            Batch generator.
+        sample_generator : `SampleGenerator`
+            Training sample generator.
         warm_start : `int` or `Path`, optional
             Restart training at this epoch or from this model.
             Default behavior (0) is to train the model from scratch.
@@ -263,6 +265,8 @@ class Trainer:
             Device on which the model will be allocated. Defaults to using CPU.
         callbacks : `list` of `Callback` instances
             Add custom callbacks.
+        parallel : `bool`, optional
+            Set to True to run
 
         Yields
         ------
@@ -282,9 +286,12 @@ class Trainer:
         self.model_ = model.to(self.device_)
 
         # BATCH GENERATOR
-        self.batch_generator_ = batch_generator
-        self.batches_ = self.batch_generator_()
-        self.batches_per_epoch_ = self.batch_generator_.batches_per_epoch
+        self.sample_generator_ = sample_generator
+        self.batches_per_epoch_ = self.sample_generator_.batches_per_epoch
+        self.batches_ = iter(
+            DataLoader(self.sample_generator_,
+                       batch_size=self.batches_per_epoch_,
+                       pin_memory=True))
 
         # OPTIMIZER
         lr = ARBITRARY_LR if learning_rate == 'auto' else learning_rate
@@ -365,11 +372,11 @@ class Trainer:
 
         logger = Logging(epochs=epochs, verbosity=verbosity)
         callbacks_.append(logger)
-      
+
         # CUSTOM CALLBACKS
         if callbacks is not None:
           callbacks_.extend(callbacks)
-        
+
         callbacks = Callbacks(callbacks_)
 
         # TRAINING STARTS
